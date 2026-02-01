@@ -1,0 +1,169 @@
+# =========================================================
+# Advanced Time Series Forecasting with Attention Mechanism
+# =========================================================
+
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+from tensorflow.keras import layers, models
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+import warnings
+warnings.filterwarnings("ignore")
+
+# ---------------------------------------------------------
+# 1. REPRODUCIBILITY
+# ---------------------------------------------------------
+np.random.seed(42)
+tf.random.set_seed(42)
+
+# ---------------------------------------------------------
+# 2. SYNTHETIC MULTIVARIATE TIME SERIES DATA
+# ---------------------------------------------------------
+time_steps = 1200
+t = np.arange(time_steps)
+
+data = pd.DataFrame({
+    "energy": np.sin(0.02 * t) + np.random.normal(0, 0.2, time_steps),
+    "temperature": np.cos(0.015 * t) + np.random.normal(0, 0.1, time_steps),
+    "humidity": np.sin(0.01 * t) + np.random.normal(0, 0.15, time_steps)
+})
+
+# Target variable
+target_col = "energy"
+
+# ---------------------------------------------------------
+# 3. NORMALIZATION
+# ---------------------------------------------------------
+scaler = MinMaxScaler()
+scaled_data = scaler.fit_transform(data)
+
+# ---------------------------------------------------------
+# 4. SEQUENCE CREATION
+# ---------------------------------------------------------
+def create_sequences(data, seq_len, forecast_horizon):
+    X, y = [], []
+    for i in range(len(data) - seq_len - forecast_horizon):
+        X.append(data[i:i+seq_len])
+        y.append(data[i+seq_len:i+seq_len+forecast_horizon, 0])
+    return np.array(X), np.array(y)
+
+SEQ_LEN = 30
+FORECAST_HORIZON = 7
+
+X, y = create_sequences(scaled_data, SEQ_LEN, FORECAST_HORIZON)
+
+# Train-Test Split
+split = int(0.8 * len(X))
+X_train, X_test = X[:split], X[split:]
+y_train, y_test = y[:split], y[split:]
+
+# ---------------------------------------------------------
+# 5. BASELINE MODEL: LSTM
+# ---------------------------------------------------------
+lstm_model = models.Sequential([
+    layers.LSTM(64, return_sequences=False, input_shape=(SEQ_LEN, X.shape[2])),
+    layers.Dense(FORECAST_HORIZON)
+])
+
+lstm_model.compile(
+    optimizer="adam",
+    loss="mse"
+)
+
+lstm_model.fit(
+    X_train, y_train,
+    epochs=10,
+    batch_size=32,
+    validation_split=0.1,
+    verbose=0
+)
+
+# ---------------------------------------------------------
+# 6. ATTENTION MODEL (TRANSFORMER STYLE)
+# ---------------------------------------------------------
+class TransformerBlock(layers.Layer):
+    def __init__(self, embed_dim, num_heads, ff_dim):
+        super().__init__()
+        self.att = layers.MultiHeadAttention(num_heads=num_heads, key_dim=embed_dim)
+        self.ffn = models.Sequential([
+            layers.Dense(ff_dim, activation="relu"),
+            layers.Dense(embed_dim)
+        ])
+        self.norm1 = layers.LayerNormalization()
+        self.norm2 = layers.LayerNormalization()
+
+    def call(self, inputs):
+        attn_output = self.att(inputs, inputs)
+        out1 = self.norm1(inputs + attn_output)
+        ffn_output = self.ffn(out1)
+        return self.norm2(out1 + ffn_output)
+
+inputs = layers.Input(shape=(SEQ_LEN, X.shape[2]))
+x = TransformerBlock(embed_dim=X.shape[2], num_heads=2, ff_dim=64)(inputs)
+x = layers.GlobalAveragePooling1D()(x)
+outputs = layers.Dense(FORECAST_HORIZON)(x)
+
+transformer_model = models.Model(inputs, outputs)
+transformer_model.compile(optimizer="adam", loss="mse")
+
+transformer_model.fit(
+    X_train, y_train,
+    epochs=10,
+    batch_size=32,
+    validation_split=0.1,
+    verbose=0
+)
+
+# ---------------------------------------------------------
+# 7. STATISTICAL MODEL: SARIMAX
+# ---------------------------------------------------------
+train_series = data[target_col][:split + SEQ_LEN]
+test_series = data[target_col][split + SEQ_LEN: split + SEQ_LEN + len(y_test)]
+
+sarimax = SARIMAX(train_series, order=(2, 1, 2))
+sarimax_fit = sarimax.fit(disp=False)
+
+sarimax_pred = sarimax_fit.forecast(len(test_series))
+
+# ---------------------------------------------------------
+# 8. EVALUATION METRICS
+# ---------------------------------------------------------
+def evaluate(true, pred):
+    rmse = np.sqrt(mean_squared_error(true, pred))
+    mae = mean_absolute_error(true, pred)
+    mape = np.mean(np.abs((true - pred) / true)) * 100
+    return rmse, mae, mape
+
+# Inverse scaling for DL models
+def inverse_transform(pred):
+    dummy = np.zeros((pred.shape[0], scaled_data.shape[1]))
+    dummy[:, 0] = pred[:, 0]
+    return scaler.inverse_transform(dummy)[:, 0]
+
+lstm_pred = lstm_model.predict(X_test)
+transformer_pred = transformer_model.predict(X_test)
+
+lstm_pred_inv = inverse_transform(lstm_pred)
+transformer_pred_inv = inverse_transform(transformer_pred)
+
+y_true = data[target_col][split + SEQ_LEN: split + SEQ_LEN + len(lstm_pred_inv)]
+
+# Metrics
+lstm_metrics = evaluate(y_true, lstm_pred_inv)
+transformer_metrics = evaluate(y_true, transformer_pred_inv)
+sarimax_metrics = evaluate(y_true, sarimax_pred.values)
+
+# ---------------------------------------------------------
+# 9. RESULTS SUMMARY
+# ---------------------------------------------------------
+results = pd.DataFrame({
+    "Model": ["LSTM", "Transformer", "SARIMAX"],
+    "RMSE": [lstm_metrics[0], transformer_metrics[0], sarimax_metrics[0]],
+    "MAE": [lstm_metrics[1], transformer_metrics[1], sarimax_metrics[1]],
+    "MAPE (%)": [lstm_metrics[2], transformer_metrics[2], sarimax_metrics[2]]
+})
+
+print("\nModel Comparison Results:\n")
+print(results)
